@@ -188,7 +188,9 @@ fi
 # Launch container with current directory mounted
 # important to pass the --init flag here for correct Vivado operation, see:
 # https://stackoverflow.com/questions/55733058/vivado-synthesis-hangs-in-docker-container-spawned-by-jenkins
-DOCKER_BASE="docker run -t --rm $DOCKER_INTERACTIVE --tty --init --hostname $DOCKER_INST_NAME "
+# DOCKER_BASE="docker run -t --rm $DOCKER_INTERACTIVE --tty --init --hostname $DOCKER_INST_NAME "
+# Changhong 24/11/08 enable GPU support in the docker container
+DOCKER_BASE="docker run -t --rm $DOCKER_INTERACTIVE --tty --init --hostname $DOCKER_INST_NAME --gpus all"
 DOCKER_EXEC="-e SHELL=/bin/bash "
 DOCKER_EXEC+="-w $SCRIPTPATH "
 DOCKER_EXEC+="-v $SCRIPTPATH:$SCRIPTPATH "
