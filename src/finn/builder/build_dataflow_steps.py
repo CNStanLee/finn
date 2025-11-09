@@ -109,7 +109,7 @@ from finn.transformation.fpgadataflow.set_fifo_depths import (
     SplitLargeFIFOs,
     xsi_fifosim,
 )
-from finn.transformation.fpgadataflow.set_folding import SetFolding
+from finn.transformation.fpgadataflow.set_folding import SetFolding, SetFoldingSparsity, AnnotateMVAUSparsity, SetMVAUSparseMode
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 from finn.transformation.fpgadataflow.synth_ooc import SynthOutOfContext
 from finn.transformation.fpgadataflow.vitis_build import VitisBuild
@@ -417,7 +417,7 @@ def step_target_fps_parallelization(model: ModelWrapper, cfg: DataflowBuildConfi
     target_cycles_per_frame = cfg._resolve_cycles_per_frame()
     if target_cycles_per_frame is not None:
         model = model.transform(
-            SetFolding(
+            SetFoldingSparsity(
                 target_cycles_per_frame,
                 mvau_wwidth_max=cfg.mvau_wwidth_max,
                 two_pass_relaxation=cfg.folding_two_pass_relaxation,
@@ -702,7 +702,7 @@ def step_measure_rtlsim_performance(model: ModelWrapper, cfg: DataflowBuildConfi
         model = model.transform(AnnotateCycles())
         perf = model.analysis(dataflow_performance)
         latency = perf["critical_path_cycles"]
-        max_iters = latency * 1.1 + 20
+        max_iters = latency * 1.1 + 100 # 20 to 100
         rtlsim_perf_dict = xsi_fifosim(model, rtlsim_bs, max_iters=max_iters)
         # keep keys consistent between the Python and C++-styles
         cycles = rtlsim_perf_dict["cycles"]
@@ -877,6 +877,73 @@ def step_deployment_package(model: ModelWrapper, cfg: DataflowBuildConfig):
     return model
 
 
+# ------------------------------------------------------------------------------#
+# Name: step_sparsity_analysis
+# Desc: Custom dataflow build step to perform sparsity analysis
+# Author: Changhong
+# Date: Nov 2025
+# ------------------------------------------------------------------------------#
+ 
+def step_sparsity_analysis(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Perform sparsity analysis on the model to identify potential pruning opportunities."""
+    model = model.transform(AnnotateMVAUSparsity())
+    return model
+
+# ------------------------------------------------------------------------------#
+# Name: step_set_mvau_sparse_mode
+# Desc: Custom dataflow build step to set MVAU sparse mode
+#       based on sparsity attribute.
+# Author: Changhong
+# Date: Nov 2025
+# ------------------------------------------------------------------------------#
+
+
+def step_set_mvau_sparse_mode(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Set sparsity mode for MVAU nodes based on sparsity attribute."""
+    model = model.transform(SetMVAUSparseMode())
+    return model
+ 
+# ------------------------------------------------------------------------------#
+# Name: step_target_fps_parallelization_sparsity
+# Desc: Custom dataflow build step to set parallelization based on target fps
+#       for sparsity-aware models.
+# Author: Changhong
+# Date: Nov 2025
+# ------------------------------------------------------------------------------#
+ 
+def step_target_fps_parallelization_sparsity(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """If target_fps was specified, use the SetFolding transformation to determine
+    parallelization attributes. The auto-generated config will be saved under
+    auto_folding_config.json under the outputs, which can serve as a basis for
+    customizing the folding factors further."""
+ 
+    target_cycles_per_frame = cfg._resolve_cycles_per_frame()
+    if target_cycles_per_frame is not None:
+        model = model.transform(
+            #SetFolding(
+            SetFoldingSparsity(
+                target_cycles_per_frame,
+                mvau_wwidth_max=cfg.mvau_wwidth_max,
+                two_pass_relaxation=cfg.folding_two_pass_relaxation,
+            )
+        )
+        # extract the suggested configuration and save it as json
+        hw_attrs = [
+            "PE",
+            "SIMD",
+            "parallel_window",
+            "ram_style",
+            "resType",
+            "mem_mode",
+            "runtime_writeable_weights",
+            "depth_trigger_uram",
+            "depth_trigger_bram",
+        ]
+        extract_model_config_to_json(model, cfg.output_dir + "/auto_folding_config.json", hw_attrs)
+ 
+    return model
+ 
+ 
 #: map step name strings to step functions
 build_dataflow_step_lookup = {
     "step_qonnx_to_finn": step_qonnx_to_finn,
@@ -898,4 +965,8 @@ build_dataflow_step_lookup = {
     "step_out_of_context_synthesis": step_out_of_context_synthesis,
     "step_synthesize_bitfile": step_synthesize_bitfile,
     "step_deployment_package": step_deployment_package,
+    # new custom steps
+    "step_sparsity_analysis": step_sparsity_analysis,
+    "step_target_fps_parallelization_sparsity": step_target_fps_parallelization_sparsity,
+    "step_set_mvau_sparse_mode": step_set_mvau_sparse_mode,
 }

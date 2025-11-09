@@ -142,6 +142,59 @@ estimate_only_dataflow_steps = [
     "step_generate_estimate_reports",
 ]
 
+# ------------------------------------------------------------------------------#
+# Name: Custom dataflow build steps lists
+# Author: Changhong
+# Date: November 2025
+# Description: Define custom lists of build steps for specific build scenarios.
+# ------------------------------------------------------------------------------#
+custom_dataflow_steps = [
+    "step_qonnx_to_finn",
+    "step_tidy_up",
+    "step_streamline",
+    "step_convert_to_hw",
+    "step_create_dataflow_partition",
+    "step_specialize_layers",
+    "step_sparsity_analysis", # new step for sparsity analysis
+    "step_target_fps_parallelization_sparsity",# modified from "step_target_fps_parallelization",
+    "step_apply_folding_config",
+    "step_set_mvau_sparse_mode", # new step to set MVAU sparse mode
+    "step_minimize_bit_width",
+    "step_generate_estimate_reports",
+    "step_hw_codegen",
+    "step_hw_ipgen",
+    "step_set_fifo_depths",
+    "step_create_stitched_ip",
+    "step_measure_rtlsim_performance",
+    "step_out_of_context_synthesis",
+    "step_synthesize_bitfile",
+    "step_make_driver",
+    "step_deployment_package",
+]
+dense_dataflow_steps = [
+    "step_qonnx_to_finn",
+    "step_tidy_up",
+    "step_streamline",
+    "step_convert_to_hw",
+    "step_create_dataflow_partition",
+    "step_specialize_layers",
+    #"step_sparsity_analysis", # new step for sparsity analysis
+    "step_target_fps_parallelization_sparsity",# modified from "step_target_fps_parallelization",
+    "step_apply_folding_config",
+    "step_set_mvau_sparse_mode", # new step to set MVAU sparse mode
+    "step_minimize_bit_width",
+    "step_generate_estimate_reports",
+    "step_hw_codegen",
+    "step_hw_ipgen",
+    "step_set_fifo_depths",
+    "step_create_stitched_ip",
+    "step_measure_rtlsim_performance",
+    "step_out_of_context_synthesis",
+    "step_synthesize_bitfile",
+    "step_make_driver",
+    "step_deployment_package",
+]
+
 #: List of steps to run for a dataflow build including HW code generation, but
 #: without any synthesis.
 hw_codegen_dataflow_steps = estimate_only_dataflow_steps + ["step_hw_codegen"]

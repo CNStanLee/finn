@@ -286,3 +286,458 @@ class SetFolding(Transformation):
                 )
 
         return (model, False)
+    
+# ------------------------------------------------------------------------------#
+# Name: AnnotateMVAUSparsity
+# Author: Changhong Li
+# Date: Nov, 2025
+# Description: Analyze and annotate MVAU nodes with sparsity information
+# ------------------------------------------------------------------------------#
+import numpy as np
+from onnx import helper
+# from finn.transformation.base import Transformation
+
+
+class AnnotateMVAUSparsity(Transformation):
+    """在图中找到所有 MVAU_hls 节点，对其权重(输入2)做稀疏度分析并写回到节点属性里"""
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[AnnotateMVAUSparsity] start")
+        print(f"[AnnotateMVAUSparsity] total nodes: {len(graph.node)}")
+
+        for idx, node in enumerate(graph.node):
+            # 只处理 MVAU_hls
+            if node.op_type != "MVAU_hls":
+                continue
+
+            print(f"\n[AnnotateMVAUSparsity] -> processing node #{idx}: name={node.name}, op_type={node.op_type}")
+
+            # MVAU 通常至少有 3 个输入: data, ... , weights
+            if len(node.input) < 3:
+                print(f"[AnnotateMVAUSparsity]    skip: node has only {len(node.input)} inputs, no weight at index 2")
+                continue
+
+            weight_name = node.input[1]
+            print(f"[AnnotateMVAUSparsity]    weight input name: {weight_name}")
+
+            # FINN 的 ModelWrapper 通常有 get_initializer
+            weight_arr = model.get_initializer(weight_name)
+            if weight_arr is None:
+                print(f"[AnnotateMVAUSparsity]    skip: weight '{weight_name}' is not an initializer (maybe runtime)")
+                continue
+
+            # 转成 np.array 并打印shape
+            w_np = weight_arr
+            if not isinstance(w_np, np.ndarray):
+                w_np = np.array(weight_arr)
+
+            print(f"[AnnotateMVAUSparsity]    weight shape: {w_np.shape}")
+
+            # 计算稀疏度: #zeros / #elements
+            flat_w = w_np.flatten()
+            total = flat_w.size
+            if total == 0:
+                print("[AnnotateMVAUSparsity]    warning: weight has 0 elements, set sparsity=0.0")
+                sparsity = 0.0
+            else:
+                num_zeros = np.count_nonzero(flat_w == 0)
+                sparsity = float(num_zeros) / float(total)
+                print(f"[AnnotateMVAUSparsity]    total elems: {total}, zeros: {num_zeros}, sparsity: {sparsity:.6f}")
+
+            # 如果节点上已有 sparsity 属性，先移除
+            kept_attrs = []
+            had_old_sparsity = False
+            for attr in node.attribute:
+                if attr.name == "sparsity":
+                    had_old_sparsity = True
+                else:
+                    kept_attrs.append(attr)
+            if had_old_sparsity:
+                print("[AnnotateMVAUSparsity]    node already had 'sparsity' attribute -> replacing")
+
+            # 清空再加回非 sparsity 的
+            del node.attribute[:]
+            for attr in kept_attrs:
+                node.attribute.append(attr)
+
+            # 加上新的 sparsity 属性
+            node.attribute.append(helper.make_attribute("sparsity", sparsity))
+            print("[AnnotateMVAUSparsity]    added attribute: sparsity =", sparsity)
+
+            graph_modified = True
+
+        print("[AnnotateMVAUSparsity] done, graph_modified =", graph_modified)
+        return (model, False)
+# ------------------------------------------------------------------------------#
+# Name: SetFoldingSparsity
+# Author: Changhong Li
+# Date: Nov, 2025
+# Description: Set folding attributes considering sparsity information
+# # + derive mem_mode to avoid FIFO overflows
+# ------------------------------------------------------------------------------#
+
+
+
+import warnings
+import numpy as np
+
+# from finn.transformation.base import Transformation
+# from finn.util.basic import (
+#     is_hls_node,
+#     is_rtl_node,
+#     getCustomOp,
+#     divisors,
+#     common_divisors,
+# )
+from finn.transformation.fpgadataflow.set_folding import (
+    GiveUniqueNodeNames,
+    AnnotateCycles,
+)
+from finn.analysis.fpgadataflow.dataflow_performance import dataflow_performance
+
+
+class SetFoldingSparsity(Transformation):
+    FIFO_LIMIT_BITS = 8191
+
+    def __init__(self, target_cycles_per_frame=1000, mvau_wwidth_max=36, two_pass_relaxation=True):
+        super().__init__()
+        self.target_cycles_per_frame = target_cycles_per_frame
+        self.mvau_wwidth_max = mvau_wwidth_max
+        self.two_pass_relaxation = two_pass_relaxation
+
+    # 小工具：把 "INT2" / "UINT4" / "BIPOLAR" 这种转成 bitwidth
+    def _weight_dtype_to_bw(self, wdt_str):
+        if not isinstance(wdt_str, str):
+            return None
+        s = wdt_str.upper()
+        # 最常见两类
+        if s.startswith("INT"):
+            # INT2 -> 2
+            try:
+                return int(s[3:])
+            except Exception:
+                return None
+        if s.startswith("UINT"):
+            try:
+                return int(s[4:])
+            except Exception:
+                return None
+        # 有些 FINN 节点可能写 BIPOLAR
+        if s == "BIPOLAR":
+            return 1
+        return None
+
+    def _set_mem_mode(self, node_inst):
+        # 没有 mem_mode 就不用管
+        try:
+            attr_types = node_inst.get_nodeattr_types()
+        except Exception:
+            return
+        if "mem_mode" not in attr_types:
+            return
+
+        # PE
+        pe = 1
+        if "PE" in attr_types:
+            pe = node_inst.get_nodeattr("PE")
+        elif "NumChannels" in attr_types:
+            pe = node_inst.get_nodeattr("NumChannels")
+
+        # SIMD
+        simd = 1
+        if "SIMD" in attr_types:
+            simd = node_inst.get_nodeattr("SIMD")
+
+        # BW：优先 weightDataType
+        bw = 1
+        if "weightDataType" in attr_types:
+            wdt_str = node_inst.get_nodeattr("weightDataType")
+            parsed = self._weight_dtype_to_bw(wdt_str)
+            if parsed is not None:
+                bw = parsed
+            else:
+                bw = 1
+        else:
+            # 没写 weightDataType 就退回到输入 dtype
+            got_bw = False
+            for port_id in [0, 1]:
+                if got_bw:
+                    break
+                try:
+                    dt = node_inst.get_input_datatype(port_id)
+                    if dt is not None:
+                        bw = dt.bitwidth()
+                        got_bw = True
+                except Exception:
+                    pass
+            if not got_bw:
+                try:
+                    dt = node_inst.get_output_datatype(0)
+                    if dt is not None:
+                        bw = dt.bitwidth()
+                except Exception:
+                    pass
+
+        stream_bits = pe * simd * bw
+        if stream_bits > self.FIFO_LIMIT_BITS:
+            node_inst.set_nodeattr("mem_mode", "internal_embedded")
+        else:
+            node_inst.set_nodeattr("mem_mode", "internal_decoupled")
+
+    def optimize_attribute_val(self, node_inst, max_val, attr_name):
+        node_inst.set_nodeattr(attr_name, 1)
+        for val in divisors(max_val):
+            node_inst.set_nodeattr(attr_name, val)
+            cyc = node_inst.get_exp_cycles()
+            if cyc < self.target_cycles_per_frame:
+                break
+
+    def apply(self, model):
+        graph = model.graph
+        pe_ops = [
+            "AddStreams_hls",
+            "ChannelwiseOp_hls",
+            "DuplicateStreams_hls",
+            "GlobalAccPool_hls",
+            "Thresholding_hls",
+            "Thresholding_rtl",
+            *ELEMENTWISE_BINARY_OPS,
+        ]
+        simd_ops = [
+            "FMPadding_rtl",
+            "FMPadding_Pixel_hls",
+            "ConvolutionInputGenerator_rtl",
+            "StreamingSplit_hls",
+            "StreamingConcat_hls",
+        ]
+        depthwise_op_exceptions = ["VVAU_hls", "VVAU_rtl", "Pool_hls"]
+
+        for node in graph.node:
+            if not (is_hls_node(node) or is_rtl_node(node)):
+                continue
+            op_type = node.op_type
+            node_inst = getCustomOp(node)
+
+            if op_type in ["MVAU_hls", "MVAU_rtl"]:
+                max_simd = node_inst.get_nodeattr("MW")
+                max_pe = node_inst.get_nodeattr("MH")
+                node_inst.set_nodeattr("PE", 1)
+                node_inst.set_nodeattr("SIMD", 1)
+                for simd_val in divisors(max_simd):
+                    prev_simd_val = node_inst.get_nodeattr("SIMD")
+                    node_inst.set_nodeattr("SIMD", simd_val)
+                    cyc = node_inst.get_exp_cycles()
+                    if cyc < self.target_cycles_per_frame:
+                        break
+                    if (
+                        node_inst.get_input_datatype(1).bitwidth() * node_inst.get_nodeattr("SIMD")
+                        > self.mvau_wwidth_max
+                    ):
+                        node_inst.set_nodeattr("SIMD", prev_simd_val)
+                        break
+                self.optimize_attribute_val(node_inst, max_pe, "PE")
+                self._set_mem_mode(node_inst)
+
+            elif op_type in pe_ops:
+                try:
+                    max_pe = node_inst.get_nodeattr("NumChannels")
+                except AttributeError:
+                    max_pe = node_inst.get_normal_input_shape()[-1]
+                self.optimize_attribute_val(node_inst, max_pe, "PE")
+                self._set_mem_mode(node_inst)
+
+            elif op_type == "LabelSelect_hls":
+                max_pe = node_inst.get_nodeattr("Labels")
+                self.optimize_attribute_val(node_inst, max_pe, "PE")
+                self._set_mem_mode(node_inst)
+
+            elif op_type in depthwise_op_exceptions:
+                if op_type in ["VVAU_hls", "VVAU_rtl"]:
+                    node_inst.set_nodeattr("SIMD", 1)
+                max_pe = node_inst.get_nodeattr("Channels")
+                self.optimize_attribute_val(node_inst, max_pe, "PE")
+                pe = node_inst.get_nodeattr("PE")
+                cyc = node_inst.get_exp_cycles()
+                if (
+                    op_type in ["VVAU_hls", "VVAU_rtl"]
+                    and pe == max_pe
+                    and cyc > self.target_cycles_per_frame
+                ):
+                    max_simd = np.prod(node_inst.get_nodeattr("Kernel"))
+                    self.optimize_attribute_val(node_inst, max_simd, "SIMD")
+
+                swu_node = model.find_producer(node.input[0])
+                if swu_node.op_type.startswith("ConvolutionInputGenerator"):
+                    swu_node_inst = getCustomOp(swu_node)
+                    swu_node_inst.set_nodeattr("SIMD", pe)
+                    if swu_node.op_type == "ConvolutionInputGenerator_rtl":
+                        if op_type.startswith("VVAU") and node_inst.get_nodeattr("SIMD") > 1:
+                            swu_node_inst.set_nodeattr("parallel_window", 1)
+                        else:
+                            swu_node_inst.set_nodeattr("parallel_window", 0)
+                else:
+                    if op_type in ["VVAU_hls", "VVAU_rtl"]:
+                        ksize = np.prod(node_inst.get_nodeattr("Kernel"))
+                    elif op_type == "Pool_hls":
+                        ksize = node_inst.get_nodeattr("KernelSize")
+                    else:
+                        raise Exception("Undefined edge case for %s" % op_type)
+                    if ksize != 1:
+                        raise Exception("Expected SWU on DW op input, found " + swu_node.op_type)
+                self._set_mem_mode(node_inst)
+
+            elif op_type in simd_ops:
+                if op_type.startswith("ConvolutionInputGenerator"):
+                    depthwise = node_inst.get_nodeattr("depthwise")
+                    if depthwise == 0:
+                        max_simd = node_inst.get_nodeattr("IFMChannels")
+                        if op_type == "ConvolutionInputGenerator_rtl":
+                            node_inst.set_nodeattr("parallel_window", 0)
+                        self.optimize_attribute_val(node_inst, max_simd, "SIMD")
+                        simd = node_inst.get_nodeattr("SIMD")
+                        cyc = node_inst.get_exp_cycles()
+                        if (
+                            op_type == "ConvolutionInputGenerator_rtl"
+                            and simd == max_simd
+                            and cyc > self.target_cycles_per_frame
+                        ):
+                            node_inst.set_nodeattr("parallel_window", 1)
+                    self._set_mem_mode(node_inst)
+                elif op_type in ["StreamingConcat_hls", "StreamingSplit_hls"]:
+                    node_inst.set_nodeattr("SIMD", 1)
+                    channels_per_stream = node_inst.get_nodeattr("ChannelsPerStream")
+                    for simd_val in common_divisors(channels_per_stream):
+                        node_inst.set_nodeattr("SIMD", simd_val)
+                        cyc = node_inst.get_exp_cycles()
+                        if cyc < self.target_cycles_per_frame:
+                            break
+                    self._set_mem_mode(node_inst)
+                else:
+                    max_simd = node_inst.get_nodeattr("NumChannels")
+                    self.optimize_attribute_val(node_inst, max_simd, "SIMD")
+                    self._set_mem_mode(node_inst)
+            else:
+                warnings.warn("SetFolding doesn't know how to handle op_type " + op_type)
+                self._set_mem_mode(node_inst)
+
+        model = model.transform(GiveUniqueNodeNames())
+        model = model.transform(AnnotateCycles())
+
+        if self.two_pass_relaxation:
+            perf_dict = model.analysis(dataflow_performance)
+            if perf_dict["max_cycles"] > self.target_cycles_per_frame:
+                warnings.warn(
+                    "Node %s is bottleneck with %d cycles, running second pass"
+                    % (perf_dict["max_cycles_node_name"], perf_dict["max_cycles"])
+                )
+                model = model.transform(
+                    SetFoldingSparsity(
+                        target_cycles_per_frame=perf_dict["max_cycles"],
+                        mvau_wwidth_max=self.mvau_wwidth_max,
+                        two_pass_relaxation=False,
+                    )
+                )
+
+        return (model, False)
+
+
+import numpy as np
+from onnx import helper, AttributeProto
+
+
+# ------------------------------------------------------------------------------#
+# Name: SetMVAUSparseMode
+# Author: Changhong Li
+# Date: Nov, 2025
+# Description: Set sparsity mode for MVAU nodes based on sparsity attribute
+# ------------------------------------------------------------------------------#
+
+
+
+class SetMVAUSparseMode(Transformation):
+    """遍历所有 MVAU_hls 节点，新增/更新 sparse_mode 属性。
+    规则：
+      1) 若 MH == PE 且 MW == SIMD -> 'lut_sparse'
+      2) 否则若 sparsity > 0.8 -> 'spmv_sparse'
+      3) 否则 -> 'dense'
+    注意：假定节点上已有 AnnotateMVAUSparsity 添加的 'sparsity' 属性。
+    若缺失则按 0.0 处理。
+    """
+
+    def _get_attr(self, node, name, default=None):
+        for attr in node.attribute:
+            if attr.name != name:
+                continue
+            # 按类型安全读取
+            if attr.type == AttributeProto.INT:
+                return int(attr.i)
+            if attr.type == AttributeProto.FLOAT:
+                return float(attr.f)
+            if attr.type == AttributeProto.STRING:
+                s = attr.s
+                try:
+                    return s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+                except Exception:
+                    return str(s)
+            if attr.type == AttributeProto.INTS:
+                return list(attr.ints)
+            if attr.type == AttributeProto.FLOATS:
+                return list(attr.floats)
+            # 其它类型用不到，返回默认
+            return default
+        return default
+
+    def _replace_attr(self, node, key, value):
+        # 删除已有的同名属性
+        kept = [a for a in node.attribute if a.name != key]
+        del node.attribute[:]
+        for a in kept:
+            node.attribute.append(a)
+        # 添加新属性
+        node.attribute.append(helper.make_attribute(key, value))
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[SetMVAUSparseMode] start")
+        print(f"[SetMVAUSparseMode] total nodes: {len(graph.node)}")
+
+        for idx, node in enumerate(graph.node):
+            if node.op_type != "MVAU_hls":
+                continue
+
+            print(f"\n[SetMVAUSparseMode] -> processing node #{idx}: name={node.name}, op_type={node.op_type}")
+
+            # 读取所需属性
+            MH   = self._get_attr(node, "MH",   None)
+            MW   = self._get_attr(node, "MW",   None)
+            PE   = self._get_attr(node, "PE",   None)
+            SIMD = self._get_attr(node, "SIMD", None)
+            sparsity = self._get_attr(node, "sparsity", 0.0)
+
+            print(f"[SetMVAUSparseMode]    MH={MH}, MW={MW}, PE={PE}, SIMD={SIMD}, sparsity={sparsity}")
+
+            # 判定模式
+            mode = "dense"
+            if (MH is not None and PE is not None and MW is not None and SIMD is not None
+                and MH == PE and MW == SIMD):
+                mode = "lut_sparse"
+                reason = "MH==PE && MW==SIMD"
+            elif sparsity is not None and float(sparsity) > 0.8:
+                mode = "spmv_sparse"
+                reason = "sparsity>0.8"
+            else:
+                reason = "fallback dense"
+
+            print(f"[SetMVAUSparseMode]    set sparse_mode='{mode}' ({reason})")
+
+            # 更新/新增 sparse_mode
+            self._replace_attr(node, "sparse_mode", mode)
+            graph_modified = True
+
+        print("[SetMVAUSparseMode] done, graph_modified =", graph_modified)
+        return (model, False)

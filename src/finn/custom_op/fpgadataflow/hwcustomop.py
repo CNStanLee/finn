@@ -95,6 +95,7 @@ class HWCustomOp(CustomOp):
             # amount of zero padding inserted during chrc.
             "io_chrc_pads_in": ("ints", False, []),
             "io_chrc_pads_out": ("ints", False, []),
+            "sparse_mode": ("s", False, "dense", {"dense", "spmv_sparse", "lut_sparse"}),
         }
 
     def make_shape_compatible_op(self, model):
@@ -296,6 +297,95 @@ class HWCustomOp(CustomOp):
         by the AXI Stream spec."""
         out_width = self.get_outstream_width(ind=ind)
         return roundup_to_integer_multiple(out_width, 8)
+
+    # hwcustomop.py 里，加入这个新函数
+    def generate_hdl_memstream_spmv(self, fpgapart, pumped_memory=0):
+        """为 SPMV 生成 4 个 memstream wrapper（sfidx/val/mask/rowlen）。"""
+        import os
+        import math
+        from qonnx.core.datatype import DataType
+
+        # 模板文件沿用原来的（模板中：module $MODULE_NAME$_memstream_wrapper (...)）
+        template_path = (
+            os.environ["FINN_ROOT"] + "/finn-rtllib/memstream/hdl/memstream_wrapper_template.v"
+        )
+        node_name = self.onnx_node.name
+        code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
+        os.makedirs(code_gen_dir, exist_ok=True)
+
+        # ---------- 计算 4 路位宽 ----------
+        PE = int(self.get_nodeattr("PE"))
+        SIMD = int(self.get_nodeattr("SIMD"))
+        MW = int(self.get_nodeattr("MW"))
+
+        # sfidx 位宽：ceil(log2(ceil(MW/SIMD)))，但至少 1
+        ncols_per_lane = max(1, (MW + SIMD - 1) // SIMD)
+        sfw = max(1, math.ceil(math.log2(ncols_per_lane)))
+
+        # 权值位宽：注意 BIPOLAR->BINARY
+        wdt = self.get_input_datatype(1)
+        if wdt == DataType["BIPOLAR"]:
+            wbits = 1
+        else:
+            wbits = wdt.bitwidth()
+
+        width_map = {
+            "sfidx":  PE * SIMD * sfw,
+            "val":    PE * SIMD * wbits,
+            "mask":   PE * SIMD * 1,
+            "rowlen": PE * 16,
+        }
+
+        # ---------- 每路 .dat 文件 & 深度（按行数） ----------
+        def _dat_and_depth(kind):
+            dat = os.path.join(code_gen_dir, f"memblock_{kind}.dat")
+            if not os.path.exists(dat):
+                # 兼容之前：还没生成对应 .dat 的情况 -> 直接 fail 提示先跑 make_spmv_files()
+                raise RuntimeError(f"[SPMV] missing {dat}, please ensure make_spmv_files() ran earlier.")
+            with open(dat, "r") as f:
+                depth = sum(1 for _ in f)
+            # UltraRAM 且目标不是 Versal：FINN 传统是清空 init 文件
+            ram_style_local = self.get_nodeattr("ram_style")
+            if ram_style_local == "ultra":
+                from finn.util.basic import is_versal
+                if not is_versal(fpgapart):
+                    dat = ""
+            return dat, depth
+
+        ram_style = self.get_nodeattr("ram_style")
+
+        # ---------- 逐路生成 wrapper ----------
+        for kind in ["sfidx", "val", "mask", "rowlen"]:
+            init_file, depth = _dat_and_depth(kind)
+            width = width_map[kind]
+
+            # 关键修复：
+            # 模板会自动在 $MODULE_NAME$ 后追加 "_memstream_wrapper"
+            # 因此这里只传“基名”，如 "<node>_sfidx"
+            mname_base = f"{node_name}_{kind}"
+            modname = f"{mname_base}_memstream_wrapper"  # 模块最终名字（也是推荐的输出文件名）
+
+            code_gen_dict = {
+                "$MODULE_NAME$":   [mname_base],        # 传“基名”，不要自带 _memstream_wrapper
+                "$SETS$":          ["1"],
+                "$DEPTH$":         [str(depth)],
+                "$WIDTH$":         [str(width)],
+                "$INIT_FILE$":     [init_file],
+                "$RAM_STYLE$":     [ram_style],
+                "$PUMPED_MEMORY$": [str(pumped_memory)],
+            }
+
+            with open(template_path, "r") as f:
+                tmpl = f.read()
+            for key, val in code_gen_dict.items():
+                tmpl = tmpl.replace(key, "\n".join(val))
+
+            # 输出文件名与模块名一致，更容易被 IPI / Vivado 正确解析引用
+            out_v = os.path.join(code_gen_dir, modname + ".v")
+            with open(out_v, "w") as f:
+                f.write(tmpl)
+
+
 
     def generate_hdl_memstream(self, fpgapart, pumped_memory=0):
         """Helper function to generate verilog code for memstream component.
