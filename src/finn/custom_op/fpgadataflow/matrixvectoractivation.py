@@ -1688,7 +1688,465 @@ class MVAU(HWCustomOp):
     #     # internal_embedded 或其他情况：只放 HLS/RTL（已在前面 instantiate_ip 并完成基础连线）
     #     cmd.append("save_bd_design")
     #     return cmd
+
+
+    
+    # def code_generation_ipi(self):
+    #     """
+    #     生成本层 IPI 连接（Vivado Tcl 命令列表）。
+    #     - 先确保 /<node> 父层级与 /<node>/<node> HLS IP 存在，并完成基础连线
+    #     - 稀疏(sparse_mode=="spmv_sparse")：4 路 memstream -> <sfx>_V （仅新命名）
+    #     - 稠密(默认)：单 memstream -> in1_V
+    #     - 动态权重(dynamic_input)：使用 *_dynamic_load_wrapper.v
+    #     说明：
+    #     稀疏 wrapper 仅兼容新命名：<node>_{sfidx|val|mask|rowlen}_memstream_wrapper.v（模块名=文件名去 .v）
+    #     """
+    #     import os
+
+    #     cmd = []
+
+    #     FINN_ROOT = os.environ.get("FINN_ROOT", "")
+    #     node_name     = self.onnx_node.name
+    #     parent        = f"/{node_name}"
+    #     hlsop         = f"/{node_name}/{node_name}"
+    #     source_target = f"./ip/verilog/rtl_ops/{node_name}"
+    #     code_gen_dir  = self.get_nodeattr("code_gen_dir_ipgen")
+
+    #     # rtllib 路径
+    #     axi_dir          = os.path.join(FINN_ROOT, "finn-rtllib/axi/hdl/")
+    #     ms_rtllib_dir    = os.path.join(FINN_ROOT, "finn-rtllib/memstream/hdl/")
+    #     dynld_rtllib_dir = os.path.join(FINN_ROOT, "finn-rtllib/dynload/hdl/")
+
+    #     # 属性
+    #     dyn_input   = bool(self.get_nodeattr("dynamic_input"))
+    #     mem_mode    = self.get_nodeattr("mem_mode")
+    #     pumped_mem  = bool(self.get_nodeattr("pumpedMemory"))
+    #     try:
+    #         sparse_mode = self.get_nodeattr("sparse_mode")
+    #     except Exception:
+    #         sparse_mode = "dense"
+
+    #     # 端口名（从 HLS 顶层抽取，避免硬编码）
+    #     vnames      = self.get_verilog_top_module_intf_names()
+    #     clk_name    = vnames["clk"][0]                 # 通常 "ap_clk"
+    #     rst_name    = vnames["rst"][0]                 # 通常 "ap_rst_n"
+    #     din_name    = vnames["s_axis"][0][0]           # 通常 "in0_V"
+    #     dout_name   = vnames["m_axis"][0][0]           # 通常 "out0_V"
+
+    #     # ---- 打开/创建 BD + 父层级 + HLS IP，并完成基础连线 ----
+    #     cmd += [
+    #         # 确保 BD 打开
+    #         'if {[catch {current_bd_design} _cur_bd]} { set _cur_bd "" }',
+    #         'if {$_cur_bd eq ""} { create_bd_design "finn_design" }',
+
+    #         # 目标目录
+    #         f'file mkdir {source_target}',
+
+    #         # 父层级 /<node>（若无则创建）与其顶层 pin/接口（幂等创建）
+    #         f'if {{![llength [get_bd_cells -quiet {parent}]]}} {{ create_bd_cell -type hier {node_name} }}',
+    #         f'if {{![llength [get_bd_pins -quiet {parent}/{clk_name}]]}} {{ create_bd_pin -dir I -type clk {parent}/{clk_name} }}',
+    #         f'if {{![llength [get_bd_pins -quiet {parent}/{rst_name}]]}} {{ create_bd_pin -dir I -type rst {parent}/{rst_name} }}',
+    #         # ap_clk2x：仅在 pumped_mem 时暴露
+    #         (f'if {{![llength [get_bd_pins -quiet {parent}/ap_clk2x]]}} {{ create_bd_pin -dir I -type clk {parent}/ap_clk2x }}'
+    #         if pumped_mem else '# no ap_clk2x on parent'),
+
+    #         f'if {{![llength [get_bd_intf_pins -quiet {parent}/{dout_name}]]}} {{ '
+    #         f'  create_bd_intf_pin -mode Master -vlnv xilinx.com:interface:axis_rtl:1.0 {parent}/{dout_name} }}',
+    #         f'if {{![llength [get_bd_intf_pins -quiet {parent}/{din_name}]]}} {{ '
+    #         f'  create_bd_intf_pin -mode Slave  -vlnv xilinx.com:interface:axis_rtl:1.0 {parent}/{din_name} }}',
+
+    #         # HLS IP /<node>/<node>（若无则从 IP Catalog 实例化 xilinx.com:hls:<node>:*）
+    #         f'if {{![llength [get_bd_cells -quiet {hlsop}]]}} {{ '
+    #         f'  set _defs [get_ipdefs -all -filter "VLNV =~ xilinx.com:hls:{node_name}:*"]; '
+    #         f'  if {{[llength $_defs]}} {{ create_bd_cell -type ip -vlnv [lindex $_defs 0] {hlsop} }} '
+    #         f'  else {{ error {{HLS IP xilinx.com:hls:{node_name}:* not found}} }} '
+    #         f'}}',
+
+    #         # 连接父层级 与 HLS 顶层端口/接口
+    #         f'if {{[llength [get_bd_pins -quiet {hlsop}/{rst_name}]]}} '
+    #         f'{{ connect_bd_net [get_bd_pins {parent}/{rst_name}] [get_bd_pins {hlsop}/{rst_name}] }}',
+    #         f'if {{[llength [get_bd_pins -quiet {hlsop}/{clk_name}]]}} '
+    #         f'{{ connect_bd_net [get_bd_pins {parent}/{clk_name}] [get_bd_pins {hlsop}/{clk_name}] }}',
+    #         f'if {{[llength [get_bd_intf_pins -quiet {hlsop}/{din_name}]]}} '
+    #         f'{{ connect_bd_intf_net [get_bd_intf_pins {parent}/{din_name}] [get_bd_intf_pins {hlsop}/{din_name}] }}',
+    #         f'if {{[llength [get_bd_intf_pins -quiet {hlsop}/{dout_name}]]}} '
+    #         f'{{ connect_bd_intf_net [get_bd_intf_pins {parent}/{dout_name}] [get_bd_intf_pins {hlsop}/{dout_name}] }}',
+    #     ]
+
+    #     # =============== 稀疏（仅新命名） ===============
+    #     if (sparse_mode == "spmv_sparse") and (not dyn_input):
+    #         set_suffixes = ["sfidx", "val", "mask", "rowlen"]
+
+    #         # 校验 4 个 wrapper 文件存在；模块名=文件名去 .v
+    #         for sfx in set_suffixes:
+    #             vfile = f"{node_name}_{sfx}_memstream_wrapper.v"
+    #             vpath = os.path.join(code_gen_dir, vfile)
+    #             if not os.path.exists(vpath):
+    #                 raise Exception(
+    #                     f"[SPMV-IPI] Missing {vpath}. Only NEW naming supported. "
+    #                     f"Please run generate_hdl_memstream_spmv() first."
+    #                 )
+
+    #         for sfx in set_suffixes:
+    #             vfile  = f"{node_name}_{sfx}_memstream_wrapper.v"
+    #             modref = vfile[:-2]                   # module == filename without ".v"
+    #             inst   = f"{node_name}_wstrm_{sfx}"
+
+    #             # add_files（带 -force）+ 刷新编译顺序
+    #             for f in [
+    #                 os.path.join(code_gen_dir, vfile),
+    #                 os.path.join(axi_dir, "axilite.sv"),
+    #                 os.path.join(ms_rtllib_dir, "memstream_axi.sv"),
+    #                 os.path.join(ms_rtllib_dir, "memstream.sv"),
+    #             ]:
+    #                 cmd += [f"add_files -copy_to {source_target} -force -norecurse {f}"]
+    #             cmd.append("update_compile_order -fileset sources_1")
+
+    #             # 实例化 wrapper
+    #             cmd.append(f"create_bd_cell -type hier -reference {modref} {parent}/{inst}")
+
+    #             # clocks & reset
+    #             cmd.append(f"connect_bd_net [get_bd_pins {parent}/{clk_name}] [get_bd_pins {parent}/{inst}/ap_clk]")
+    #             cmd.append(f"connect_bd_net [get_bd_pins {parent}/{rst_name}] [get_bd_pins {parent}/{inst}/ap_rst_n]")
+    #             if pumped_mem:
+    #                 cmd.append(f"connect_bd_net [get_bd_pins {parent}/ap_clk2x] [get_bd_pins {parent}/{inst}/ap_clk2x]")
+    #             else:
+    #                 cmd.append(f"connect_bd_net [get_bd_pins {parent}/{clk_name}] [get_bd_pins {parent}/{inst}/ap_clk2x]")
+
+    #             # AXIS：wrapper -> HLS <sfx>_V
+    #             cmd.append(
+    #                 f"connect_bd_intf_net [get_bd_intf_pins {parent}/{inst}/m_axis_0] "
+    #                 f"[get_bd_intf_pins {hlsop}/{sfx}_V]"
+    #             )
+
+    #         # 暴露 4 个 AXI-Lite 并连接
+    #         for sfx in set_suffixes:
+    #             inst = f"{node_name}_wstrm_{sfx}"
+    #             axil = f"s_axilite_{sfx}"
+    #             cmd.append(
+    #                 f"if {{![llength [get_bd_intf_pins -quiet {parent}/{axil}]]}} "
+    #                 f"{{ create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 {parent}/{axil} }}"
+    #             )
+    #             cmd.append(
+    #                 f"connect_bd_intf_net [get_bd_intf_pins {parent}/{axil}] "
+    #                 f"[get_bd_intf_pins {parent}/{inst}/s_axilite]"
+    #             )
+
+    #         cmd.append("assign_bd_address")
+    #         cmd.append("save_bd_design")
+    #         return cmd
+
+    #     # =============== 动态权重（保持原逻辑） ===============
+    #     if dyn_input:
+    #         file_suffix = "_dynamic_load_wrapper.v"
+    #         dynld_tmpl = None
+    #         for fname in os.listdir(code_gen_dir):
+    #             if fname.endswith(file_suffix):
+    #                 dynld_tmpl = fname
+    #                 break
+    #         if dynld_tmpl is None:
+    #             raise Exception(f"[DYNLOAD-IPI] Missing *{file_suffix} under {code_gen_dir}")
+
+    #         dynld_tmpl_name = dynld_tmpl[:-2]
+    #         sourcefiles = [
+    #             os.path.join(code_gen_dir, dynld_tmpl),
+    #             os.path.join(dynld_rtllib_dir, "ram_p_c.sv"),
+    #             os.path.join(dynld_rtllib_dir, "dynamic_load.sv"),
+    #         ]
+    #         for f in sourcefiles:
+    #             cmd += [f"add_files -copy_to {source_target} -force -norecurse {f}"]
+    #         cmd.append("update_compile_order -fileset sources_1")
+
+    #         dynld_inst = f"{node_name}_wdynld"
+    #         cmd.append(f"create_bd_cell -type hier -reference {dynld_tmpl_name} {parent}/{dynld_inst}")
+
+    #         # clocks & reset
+    #         cmd.append(f"connect_bd_net [get_bd_pins {parent}/{clk_name}] [get_bd_pins {parent}/{dynld_inst}/ap_clk]")
+    #         cmd.append(f"connect_bd_net [get_bd_pins {parent}/{rst_name}] [get_bd_pins {parent}/{dynld_inst}/ap_rst_n]")
+
+    #         # 额外暴露动态权重入口（第二路 s_axis）
+    #         if len(vnames["s_axis"]) < 2:
+    #             raise Exception("[DYNLOAD-IPI] HLS top doesn't expose secondary s_axis for dynamic load.")
+    #         win_name = vnames["s_axis"][1][0]  # e.g., in1_V
+    #         cmd.append(
+    #             f"if {{![llength [get_bd_intf_pins -quiet {parent}/{win_name}]]}} "
+    #             f"{{ create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:axis_rtl:1.0 {parent}/{win_name} }}"
+    #         )
+
+    #         # AXIS：dynloader -> HLS in1_V
+    #         cmd.append(
+    #             f"connect_bd_intf_net [get_bd_intf_pins {parent}/{dynld_inst}/m_axis_0] "
+    #             f"[get_bd_intf_pins {hlsop}/in1_V]"
+    #         )
+    #         # 上游 -> dynloader
+    #         cmd.append(
+    #             f"connect_bd_intf_net [get_bd_intf_pins {parent}/{win_name}] "
+    #             f"[get_bd_intf_pins {parent}/{dynld_inst}/s_axis_0]"
+    #         )
+
+    #         cmd.append("save_bd_design")
+    #         return cmd
+
+    #     # =============== 稠密（单流 -> in1_V） ===============
+    #     if mem_mode in ["internal_decoupled", "external"]:
+    #         runtime_writable = (self.get_nodeattr("runtime_writeable_weights") == 1)
+
+    #         # 找到唯一 *_memstream_wrapper.v
+    #         candidates = [f for f in os.listdir(code_gen_dir) if f.endswith("_memstream_wrapper.v")]
+    #         if len(candidates) != 1:
+    #             raise Exception(
+    #                 f"[DENSE-IPI] Expect exactly one '*_memstream_wrapper.v' under {code_gen_dir}, got {len(candidates)}"
+    #             )
+    #         strm_tmpl  = candidates[0]
+    #         strm_modref= strm_tmpl[:-2]
+    #         strm_inst  = f"{node_name}_wstrm"
+
+    #         # add_files（-force）
+    #         for f in [
+    #             os.path.join(code_gen_dir, strm_tmpl),
+    #             os.path.join(axi_dir, "axilite.sv"),
+    #             os.path.join(ms_rtllib_dir, "memstream_axi.sv"),
+    #             os.path.join(ms_rtllib_dir, "memstream.sv"),
+    #         ]:
+    #             cmd += [f"add_files -copy_to {source_target} -force -norecurse {f}"]
+    #         cmd.append("update_compile_order -fileset sources_1")
+
+    #         # 实例化 wrapper
+    #         cmd.append(f"create_bd_cell -type hier -reference {strm_modref} {parent}/{strm_inst}")
+
+    #         # clocks & reset
+    #         cmd.append(f"connect_bd_net [get_bd_pins {parent}/{clk_name}] [get_bd_pins {parent}/{strm_inst}/ap_clk]")
+    #         cmd.append(f"connect_bd_net [get_bd_pins {parent}/{rst_name}] [get_bd_pins {parent}/{strm_inst}/ap_rst_n]")
+    #         # ap_clk2x：按 dense.tcl 的做法，缺省绑到 ap_clk；如确需 2x，再开启 pumped_mem
+    #         if pumped_mem:
+    #             cmd.append(f"connect_bd_net [get_bd_pins {parent}/ap_clk2x] [get_bd_pins {parent}/{strm_inst}/ap_clk2x]")
+    #         else:
+    #             cmd.append(f"connect_bd_net [get_bd_pins {parent}/{clk_name}] [get_bd_pins {parent}/{strm_inst}/ap_clk2x]")
+
+    #         # AXIS：wrapper -> HLS in1_V
+    #         cmd.append(
+    #             f"connect_bd_intf_net [get_bd_intf_pins {parent}/{strm_inst}/m_axis_0] "
+    #             f"[get_bd_intf_pins {hlsop}/in1_V]"
+    #         )
+
+    #         # 仅 runtime 可写时暴露 AXI-Lite
+    #         if runtime_writable:
+    #             axilite_name = "s_axilite"
+    #             cmd.append(
+    #                 f"if {{![llength [get_bd_intf_pins -quiet {parent}/{axilite_name}]]}} "
+    #                 f"{{ create_bd_intf_pin -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 {parent}/{axilite_name} }}"
+    #             )
+    #             cmd.append(
+    #                 f"connect_bd_intf_net [get_bd_intf_pins {parent}/{axilite_name}] "
+    #                 f"[get_bd_intf_pins {parent}/{strm_inst}/{axilite_name}]"
+    #             )
+    #             cmd.append("assign_bd_address")
+
+    #         cmd.append("save_bd_design")
+    #         return cmd
+
+    #     # 其它 mem_mode：只保存
+    #     cmd.append("save_bd_design")
+    #     return cmd
     def code_generation_ipi(self):
+        try:
+            sparse_mode = self.get_nodeattr("sparse_mode")
+        except AttributeError:
+            sparse_mode = "dense"
+
+        if sparse_mode == "spmv_sparse":
+            cmd = self.code_generation_ipi_hls()
+        else:
+            cmd = self.code_generation_ipi_default()
+
+        return cmd
+
+    def code_generation_ipi_default(self):
+        source_target = "./ip/verilog/rtl_ops/%s" % self.onnx_node.name
+        cmd = ["file mkdir %s" % source_target]
+        dyn_input = self.get_nodeattr("dynamic_input")
+        mem_mode = self.get_nodeattr("mem_mode")
+        sname = "V"
+
+        # check if additional components are needed
+        if dyn_input or mem_mode == "internal_decoupled":
+            node_name = self.onnx_node.name
+            # create a hierarchy for this layer, with the same port names
+            clk_name = self.get_verilog_top_module_intf_names()["clk"][0]
+            rst_name = self.get_verilog_top_module_intf_names()["rst"][0]
+            dout_name = self.get_verilog_top_module_intf_names()["m_axis"][0][0]
+            din_name = self.get_verilog_top_module_intf_names()["s_axis"][0][0]
+            cmd.append("create_bd_cell -type hier %s" % node_name)
+            # clock and reset
+            cmd.append("create_bd_pin -dir I -type clk /%s/%s" % (node_name, clk_name))
+            cmd.append("create_bd_pin -dir I -type rst /%s/%s" % (node_name, rst_name))
+            # if we need a 2x clock for either compute or memory, instantiate the 2x clk port
+            try:
+                pumped_compute = self.get_nodeattr("pumpedCompute")
+            except AttributeError:
+                pumped_compute = 0
+            if pumped_compute or self.get_nodeattr("pumpedMemory"):
+                clk2x_name = self.get_verilog_top_module_intf_names()["clk2x"][0]
+                cmd.append("create_bd_pin -dir I -type clk /%s/%s" % (node_name, clk2x_name))
+            else:
+                clk2x_name = None
+            # streams
+            cmd.append(
+                "create_bd_intf_pin -mode Master "
+                "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s" % (node_name, dout_name)
+            )
+            cmd.append(
+                "create_bd_intf_pin -mode Slave "
+                "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s" % (node_name, din_name)
+            )
+            # instantiate the RTL block
+            # Instantiate either the HLS or RTL IP depending on operator
+            self.instantiate_ip(cmd)
+            # connect MVAU
+            cmd.append(
+                "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/%s]"
+                % (node_name, rst_name, node_name, node_name, rst_name)
+            )
+            cmd.append(
+                "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/%s]"
+                % (node_name, clk_name, node_name, node_name, clk_name)
+            )
+            cmd.append(
+                "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
+                "[get_bd_intf_pins %s/%s/%s]"
+                % (node_name, din_name, node_name, node_name, din_name)
+            )
+            cmd.append(
+                "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
+                "[get_bd_intf_pins %s/%s/%s]"
+                % (node_name, dout_name, node_name, node_name, dout_name)
+            )
+
+            code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
+            if dyn_input:
+                # dynamic loader
+                dynld_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/dynload/hdl/")
+                file_suffix = "_dynamic_load_wrapper.v"
+                # automatically find memstream verilog component in code generation directory
+                for fname in os.listdir(code_gen_dir):
+                    if fname.endswith(file_suffix):
+                        dynld_tmpl = fname
+                dynld_tmpl_name = dynld_tmpl[:-2]
+                sourcefiles = [
+                    os.path.join(code_gen_dir, dynld_tmpl),
+                    dynld_rtllib_dir + "ram_p_c.sv",
+                    dynld_rtllib_dir + "dynamic_load.sv",
+                ]
+                for f in sourcefiles:
+                    cmd += ["add_files -copy_to %s -norecurse %s" % (source_target, f)]
+                dynld_inst = node_name + "_wdynld"
+                # instantiate the cell
+                cmd.append(
+                    "create_bd_cell -type hier -reference %s /%s/%s"
+                    % (dynld_tmpl_name, node_name, dynld_inst)
+                )
+                # additional dynamic input
+                win_name = self.get_verilog_top_module_intf_names()["s_axis"][1][0]
+                cmd.append(
+                    "create_bd_intf_pin -mode Slave "
+                    "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s" % (node_name, win_name)
+                )
+                # connect
+                cmd.append(
+                    "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_clk]"
+                    % (node_name, clk_name, node_name, dynld_inst)
+                )
+                cmd.append(
+                    "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_rst_n]"
+                    % (node_name, rst_name, node_name, dynld_inst)
+                )
+                cmd.append(
+                    "connect_bd_intf_net [get_bd_intf_pins %s/%s/m_axis_0] "
+                    "[get_bd_intf_pins %s/%s/in1_%s]"
+                    % (node_name, dynld_inst, node_name, node_name, sname)
+                )
+                cmd.append(
+                    "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
+                    "[get_bd_intf_pins %s/%s/s_axis_0]"
+                    % (node_name, win_name, node_name, dynld_inst)
+                )
+            else:
+                # memstream
+                runtime_writable = self.get_nodeattr("runtime_writeable_weights") == 1
+                axi_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/axi/hdl/")
+                ms_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/memstream/hdl/")
+                file_suffix = "_memstream_wrapper.v"
+                # automatically find memstream verilog component in code generation directory
+                for fname in os.listdir(code_gen_dir):
+                    if fname.endswith(file_suffix):
+                        strm_tmpl = fname
+                strm_tmpl_name = strm_tmpl[:-2]
+                sourcefiles = [
+                    os.path.join(code_gen_dir, strm_tmpl),
+                    axi_dir + "axilite.sv",
+                    ms_rtllib_dir + "memstream_axi.sv",
+                    ms_rtllib_dir + "memstream.sv",
+                ]
+                for f in sourcefiles:
+                    cmd += ["add_files -copy_to %s -norecurse %s" % (source_target, f)]
+                strm_inst = node_name + "_wstrm"
+                # instantiate the cell
+                cmd.append(
+                    "create_bd_cell -type hier -reference %s /%s/%s"
+                    % (strm_tmpl_name, node_name, strm_inst)
+                )
+                # connect
+                cmd.append(
+                    "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_clk]"
+                    % (node_name, clk_name, node_name, strm_inst)
+                )
+                cmd.append(
+                    "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_rst_n]"
+                    % (node_name, rst_name, node_name, strm_inst)
+                )
+                # if using 2x pumped memory, connect the memstreamer's 2x clk input
+                # to the 2x clock port. otherwise connect it to the regular clock port.
+                if self.get_nodeattr("pumpedMemory"):
+                    cmd.append(
+                        "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_clk2x]"
+                        % (node_name, clk2x_name, node_name, strm_inst)
+                    )
+                else:
+                    cmd.append(
+                        "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_clk2x]"
+                        % (node_name, clk_name, node_name, strm_inst)
+                    )
+                cmd.append(
+                    "connect_bd_intf_net [get_bd_intf_pins %s/%s/m_axis_0] "
+                    "[get_bd_intf_pins %s/%s/in1_%s]"
+                    % (node_name, strm_inst, node_name, node_name, sname)
+                )
+                # runtime writeable weights
+                if runtime_writable:
+                    axilite_name = self.get_verilog_top_module_intf_names()["axilite"][0]
+                    cmd.append(
+                        "create_bd_intf_pin -mode Slave "
+                        "-vlnv xilinx.com:interface:aximm_rtl:1.0 /%s/%s"
+                        % (node_name, axilite_name)
+                    )
+                    cmd.append(
+                        "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
+                        "[get_bd_intf_pins %s/%s/%s]"
+                        % (node_name, axilite_name, node_name, strm_inst, axilite_name)
+                    )
+                    # TODO calculate and pass in segment size here
+                    cmd.append("assign_bd_address")
+
+            # save bd
+            cmd.append("save_bd_design")
+        elif mem_mode == "internal_embedded" or mem_mode == "external":
+            # base class impl sufficient for internal_embedded/external modes
+            self.instantiate_ip(cmd)
+        else:
+            raise Exception("Unrecognized mem_mode for MatrixVectorActivation")
+        return cmd
+    
+    def code_generation_ipi_hls(self):
         """
         生成本层 IPI 连接（Vivado Tcl 命令列表）。
         - 先确保 /<node> 父层级与 /<node>/<node> HLS IP 存在，并完成基础连线

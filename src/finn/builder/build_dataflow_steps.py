@@ -109,7 +109,7 @@ from finn.transformation.fpgadataflow.set_fifo_depths import (
     SplitLargeFIFOs,
     xsi_fifosim,
 )
-from finn.transformation.fpgadataflow.set_folding import SetFolding, SetFoldingSparsity, AnnotateMVAUSparsity, SetMVAUSparseMode
+from finn.transformation.fpgadataflow.set_folding import SetFolding, SetFoldingSparsity, AnnotateMVAUSparsity, SetMVAUSparseMode, SetMVAUSparseMode_spmvonly, SetMVAUSparseMode_lutsponly, AnnotateMVAUTileSparsity, SetMVAUSparseModeHybrid, GlobalPruneMVAUWeights90, GlobalPruneMBv1Weights90
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 from finn.transformation.fpgadataflow.synth_ooc import SynthOutOfContext
 from finn.transformation.fpgadataflow.vitis_build import VitisBuild
@@ -702,7 +702,7 @@ def step_measure_rtlsim_performance(model: ModelWrapper, cfg: DataflowBuildConfi
         model = model.transform(AnnotateCycles())
         perf = model.analysis(dataflow_performance)
         latency = perf["critical_path_cycles"]
-        max_iters = latency * 1.1 + 100 # 20 to 100
+        max_iters = latency * 1.1 + 600 # 20 to 100
         rtlsim_perf_dict = xsi_fifosim(model, rtlsim_bs, max_iters=max_iters)
         # keep keys consistent between the Python and C++-styles
         cycles = rtlsim_perf_dict["cycles"]
@@ -889,6 +889,11 @@ def step_sparsity_analysis(model: ModelWrapper, cfg: DataflowBuildConfig):
     model = model.transform(AnnotateMVAUSparsity())
     return model
 
+def step_analyze_tile_sparsity(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Perform tile-level sparsity analysis on the model to identify potential pruning opportunities."""
+    model = model.transform(AnnotateMVAUTileSparsity())
+    return model
+
 # ------------------------------------------------------------------------------#
 # Name: step_set_mvau_sparse_mode
 # Desc: Custom dataflow build step to set MVAU sparse mode
@@ -902,7 +907,33 @@ def step_set_mvau_sparse_mode(model: ModelWrapper, cfg: DataflowBuildConfig):
     """Set sparsity mode for MVAU nodes based on sparsity attribute."""
     model = model.transform(SetMVAUSparseMode())
     return model
+
+def step_set_mvau_sparse_mode_spmv_only(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Set sparsity mode for MVAU nodes based on sparsity attribute."""
+    model = model.transform(SetMVAUSparseMode_spmvonly())
+    return model
+
+def step_set_mvau_sparse_mode_lutsp_only(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Set sparsity mode for MVAU nodes based on sparsity attribute."""
+    model = model.transform(SetMVAUSparseMode_lutsponly())
+    return model
+
+def step_set_mvau_sparse_mode_hybrid(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Set sparsity mode for MVAU nodes based on sparsity attribute."""
+    fpgapart=cfg._resolve_fpga_part()
+    model = model.transform(SetMVAUSparseModeHybrid(fpgapart))
+    return model
  
+def step_mvau_90_pruning(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Apply 90% pruning to MVAU nodes."""
+    model = model.transform(GlobalPruneMVAUWeights90())
+    return model
+
+def step_mbv1_90_pruning(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Apply 90% pruning to MBv1 nodes."""
+    model = model.transform(GlobalPruneMBv1Weights90())
+    return model
+
 # ------------------------------------------------------------------------------#
 # Name: step_target_fps_parallelization_sparsity
 # Desc: Custom dataflow build step to set parallelization based on target fps
@@ -943,6 +974,9 @@ def step_target_fps_parallelization_sparsity(model: ModelWrapper, cfg: DataflowB
  
     return model
  
+
+
+
  
 #: map step name strings to step functions
 build_dataflow_step_lookup = {
@@ -969,4 +1003,10 @@ build_dataflow_step_lookup = {
     "step_sparsity_analysis": step_sparsity_analysis,
     "step_target_fps_parallelization_sparsity": step_target_fps_parallelization_sparsity,
     "step_set_mvau_sparse_mode": step_set_mvau_sparse_mode,
+    "step_set_mvau_sparse_mode_spmv_only": step_set_mvau_sparse_mode_spmv_only,
+    "step_set_mvau_sparse_mode_lutsp_only": step_set_mvau_sparse_mode_lutsp_only,
+    "step_analyze_tile_sparsity": step_analyze_tile_sparsity,
+    "step_set_mvau_sparse_mode_hybrid": step_set_mvau_sparse_mode_hybrid,
+    "step_mvau_90_pruning": step_mvau_90_pruning,
+    "step_mbv1_90_pruning": step_mbv1_90_pruning,
 }

@@ -171,6 +171,101 @@ custom_dataflow_steps = [
     "step_make_driver",
     "step_deployment_package",
 ]
+
+
+hybridsp_estimate_steps = [
+    "step_qonnx_to_finn",
+    "step_tidy_up",
+    "step_streamline",
+    "step_convert_to_hw",
+    "step_create_dataflow_partition",
+    "step_specialize_layers",
+    "step_sparsity_analysis", # new step for sparsity analysis
+    "step_target_fps_parallelization_sparsity",# modified from "step_target_fps_parallelization",
+    "step_apply_folding_config",
+    # tile sparsity analysis
+    "step_analyze_tile_sparsity",
+    "step_set_mvau_sparse_mode_hybrid", # new step to set MVAU sparse mode
+    "step_minimize_bit_width",
+    "step_generate_estimate_reports",
+]
+
+
+hybridsp_dataflow_steps = [
+    "step_qonnx_to_finn",
+    "step_tidy_up",
+    "step_streamline",
+    "step_convert_to_hw",
+    "step_create_dataflow_partition",
+    "step_specialize_layers",
+    "step_sparsity_analysis", # new step for sparsity analysis
+    "step_target_fps_parallelization_sparsity",# modified from "step_target_fps_parallelization",
+    "step_apply_folding_config",
+    # tile sparsity analysis
+    "step_analyze_tile_sparsity", # new step for tile sparsity analysis
+    "step_set_mvau_sparse_mode_hybrid", # new step to set MVAU sparse mode
+    "step_minimize_bit_width",
+    "step_generate_estimate_reports",
+    "step_hw_codegen", # modified to include hw_codegen
+    "step_hw_ipgen",
+    "step_set_fifo_depths",
+    "step_create_stitched_ip",
+    "step_measure_rtlsim_performance",
+    "step_out_of_context_synthesis",
+    "step_synthesize_bitfile",
+    "step_make_driver",
+    "step_deployment_package",
+]
+
+spmv_only_dataflow_steps = [
+    "step_qonnx_to_finn",
+    "step_tidy_up",
+    "step_streamline",
+    "step_convert_to_hw",
+    "step_create_dataflow_partition",
+    "step_specialize_layers",
+    "step_sparsity_analysis", # new step for sparsity analysis
+    "step_target_fps_parallelization_sparsity",# modified from "step_target_fps_parallelization",
+    "step_apply_folding_config",
+    "step_set_mvau_sparse_mode_spmv_only", # new step to set MVAU sparse mode
+    "step_minimize_bit_width",
+    "step_generate_estimate_reports",
+    "step_hw_codegen",
+    "step_hw_ipgen",
+    "step_set_fifo_depths",
+    "step_create_stitched_ip",
+    "step_measure_rtlsim_performance",
+    "step_out_of_context_synthesis",
+    "step_synthesize_bitfile",
+    "step_make_driver",
+    "step_deployment_package",
+]
+
+lutsp_only_dataflow_steps = [
+    "step_qonnx_to_finn",
+    "step_tidy_up",
+    "step_streamline",
+    "step_convert_to_hw",
+    "step_create_dataflow_partition",
+    "step_specialize_layers",
+    "step_sparsity_analysis", # new step for sparsity analysis
+    "step_target_fps_parallelization_sparsity",# modified from "step_target_fps_parallelization",
+    "step_apply_folding_config",
+    "step_set_mvau_sparse_mode_lutsp_only", # new step to set MVAU sparse mode
+    "step_minimize_bit_width",
+    "step_generate_estimate_reports",
+    "step_hw_codegen",
+    "step_hw_ipgen",
+    "step_set_fifo_depths",
+    "step_create_stitched_ip",
+    "step_measure_rtlsim_performance",
+    "step_out_of_context_synthesis",
+    "step_synthesize_bitfile",
+    "step_make_driver",
+    "step_deployment_package",
+]
+
+
 dense_dataflow_steps = [
     "step_qonnx_to_finn",
     "step_tidy_up",
@@ -181,7 +276,7 @@ dense_dataflow_steps = [
     #"step_sparsity_analysis", # new step for sparsity analysis
     "step_target_fps_parallelization_sparsity",# modified from "step_target_fps_parallelization",
     "step_apply_folding_config",
-    "step_set_mvau_sparse_mode", # new step to set MVAU sparse mode
+    #"step_set_mvau_sparse_mode", # new step to set MVAU sparse mode
     "step_minimize_bit_width",
     "step_generate_estimate_reports",
     "step_hw_codegen",

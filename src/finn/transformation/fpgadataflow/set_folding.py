@@ -655,7 +655,182 @@ from onnx import helper, AttributeProto
 # Description: Set sparsity mode for MVAU nodes based on sparsity attribute
 # ------------------------------------------------------------------------------#
 
+class SetMVAUSparseModeHybrid(Transformation):
+    """遍历所有 MVAU_hls 节点，新增/更新 sparse_mode 属性。
+    规则：
+      1) 若 MH == PE 且 MW == SIMD -> 'lut_sparse'
+      2) 否则若 sparsity > 0.8 -> 'spmv_sparse'
+      3) 否则 -> 'dense'
+    注意：假定节点上已有 AnnotateMVAUSparsity 添加的 'sparsity' 属性。
+    若缺失则按 0.0 处理。
+    """
+    def __init__(self, fpga_part=None):
+        super().__init__()
+        self.fpga_part = fpga_part
 
+    def _get_attr(self, node, name, default=None):
+        for attr in node.attribute:
+            if attr.name != name:
+                continue
+            # 按类型安全读取
+            if attr.type == AttributeProto.INT:
+                return int(attr.i)
+            if attr.type == AttributeProto.FLOAT:
+                return float(attr.f)
+            if attr.type == AttributeProto.STRING:
+                s = attr.s
+                try:
+                    return s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+                except Exception:
+                    return str(s)
+            if attr.type == AttributeProto.INTS:
+                return list(attr.ints)
+            if attr.type == AttributeProto.FLOATS:
+                return list(attr.floats)
+            # 其它类型用不到，返回默认
+            return default
+        return default
+
+    def _replace_attr(self, node, key, value):
+        # 删除已有的同名属性
+        kept = [a for a in node.attribute if a.name != key]
+        del node.attribute[:]
+        for a in kept:
+            node.attribute.append(a)
+        # 添加新属性
+        node.attribute.append(helper.make_attribute(key, value))
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[SetMVAUSparseMode] start")
+        print(f"[SetMVAUSparseMode] total nodes: {len(graph.node)}")
+
+        for idx, node in enumerate(graph.node):
+            if node.op_type != "MVAU_hls":
+                continue
+
+            print(f"\n[SetMVAUSparseMode] -> processing node #{idx}: name={node.name}, op_type={node.op_type}")
+
+            # 读取所需属性
+            # MH   = self._get_attr(node, "MH",   None)
+            # MW   = self._get_attr(node, "MW",   None)
+            # PE   = self._get_attr(node, "PE",   None)
+            # SIMD = self._get_attr(node, "SIMD", None)
+            # sparsity = self._get_attr(node, "sparsity", 0.0)
+
+            # print(f"[SetMVAUSparseMode]    MH={MH}, MW={MW}, PE={PE}, SIMD={SIMD}, sparsity={sparsity}")
+
+          
+            # mode = "dense"
+            # if (MH is not None and PE is not None and MW is not None and SIMD is not None
+            #     and MH == PE and MW == SIMD):
+            #     mode = "lut_sparse"
+
+            #     mem_mode = 'internal_embedded'
+
+            #     self._replace_attr(node, "mem_mode", mem_mode)
+
+            #     reason = "MH==PE && MW==SIMD"
+            # elif sparsity is not None and float(sparsity) > 0.5:
+            #     mode = "spmv_sparse"
+            #     reason = "sparsity>0.5"
+            # else:
+            #     reason = "fallback dense"
+
+            # print(f"[SetMVAUSparseMode]    set sparse_mode='{mode}' ({reason})")
+
+            MH   = self._get_attr(node, "MH",   None)
+            MW   = self._get_attr(node, "MW",   None)
+            PE   = self._get_attr(node, "PE",   None)
+            SIMD = self._get_attr(node, "SIMD", None)
+            sparsity = self._get_attr(node, "sparsity", 0.0)
+            tile_sparsity = self._get_attr(node, "tile_sparsity", 0.0)
+
+            print(f"[SetMVAUSparseMode] MH={MH}, MW={MW}, PE={PE}, SIMD={SIMD}, "
+                f"sparsity={sparsity}, tile_sparsity={tile_sparsity}")
+
+            mode = "dense"
+            mem_mode = None
+
+            unfold_lutsp_ok = False
+            # resource estimation before change            
+            node_inst = getCustomOp(node)
+            res_dict = {}
+            res_dict[node.name] = node_inst.node_res_estimation(self.fpga_part)
+            res = res_dict[node.name]
+            # get lut value
+            lut_val = int(res.get("LUT", 0))
+            print(f"[SetMVAUSparseMode]    estimated LUTs: {lut_val}")
+            self._replace_attr(node, "PE", MH)
+            self._replace_attr(node, "SIMD", MW)
+            node_inst = getCustomOp(node)
+            res_dict = {}
+            res_dict[node.name] = node_inst.node_res_estimation(self.fpga_part)
+            res = res_dict[node.name]
+            # get lut value
+            lut_val_new = int(res.get("LUT", 0))
+            print(f"[SetMVAUSparseMode]    estimated UNFOLD LUTs: {lut_val_new}")
+            # check if lut sp is ok?
+            sparsed_lut = lut_val_new * (1 - sparsity) * 1.95
+            print(f"[SetMVAUSparseMode]    estimated sparse unfold LUTs: {sparsed_lut}")
+            if (sparsed_lut < lut_val) and (MW * MH < 38500):
+                unfold_lutsp_ok = True
+                print(f"[SetMVAUSparseMode]    unfold lut sparse mode is OK")
+            else:
+                unfold_lutsp_ok = False
+                print(f"[SetMVAUSparseMode]    unfold lut sparse mode is NOT OK")
+            # revert back
+            self._replace_attr(node, "PE", PE)
+            self._replace_attr(node, "SIMD", SIMD)
+
+
+
+
+
+
+
+
+            # 1) 全局稀疏度 < 0.6，直接 dense
+            if sparsity is not None and float(sparsity) < 0.6:
+                reason = "sparsity<0.6 -> dense"
+
+            # 2) 判断是否全展开：MH==PE && MW==SIMD，全展开直接 lut_sparse
+            elif (MH is not None and PE is not None and
+                MW is not None and SIMD is not None and
+                MH == PE and MW == SIMD):
+                mode = "lut_sparse"
+                mem_mode = "internal_embedded"
+                self._replace_attr(node, "mem_mode", mem_mode)
+                reason = "fully unrolled: MH==PE && MW==SIMD"
+
+            # 3) 按 tile_sparsity 决定：>0.7 -> spmv_sparse
+            elif tile_sparsity is not None and float(tile_sparsity) > 0.7:
+                mode = "spmv_sparse"
+                reason = "tile_sparsity>0.7"
+            # 4) CHECK IF LUT SP OK?
+            elif unfold_lutsp_ok:
+                self._replace_attr(node, "PE", MH)
+                self._replace_attr(node, "SIMD", MW)
+                mode = "lut_sparse"
+                mem_mode = "internal_embedded"
+                self._replace_attr(node, "mem_mode", mem_mode)
+                reason = "fully unrolled: unfold lut sparse mode is OK"
+            # 5) 其他情况弹回 dense
+            else:
+                reason = "fallback dense"
+
+
+            print(f"[SetMVAUSparseMode] mode={mode}, reason={reason}")
+
+
+            # 更新/新增 sparse_mode
+            self._replace_attr(node, "sparse_mode", mode)
+            graph_modified = True
+
+        print("[SetMVAUSparseMode] done, graph_modified =", graph_modified)
+        return (model, False)
 
 class SetMVAUSparseMode(Transformation):
     """遍历所有 MVAU_hls 节点，新增/更新 sparse_mode 属性。
@@ -740,4 +915,646 @@ class SetMVAUSparseMode(Transformation):
             graph_modified = True
 
         print("[SetMVAUSparseMode] done, graph_modified =", graph_modified)
+        return (model, False)
+    
+class SetMVAUSparseMode_spmvonly(Transformation):
+    """遍历所有 MVAU_hls 节点，新增/更新 sparse_mode 属性。
+    规则：
+      1) 若 MH == PE 且 MW == SIMD -> 'lut_sparse'
+      2) 否则若 sparsity > 0.8 -> 'spmv_sparse'
+      3) 否则 -> 'dense'
+    注意：假定节点上已有 AnnotateMVAUSparsity 添加的 'sparsity' 属性。
+    若缺失则按 0.0 处理。
+    """
+
+    def _get_attr(self, node, name, default=None):
+        for attr in node.attribute:
+            if attr.name != name:
+                continue
+            # 按类型安全读取
+            if attr.type == AttributeProto.INT:
+                return int(attr.i)
+            if attr.type == AttributeProto.FLOAT:
+                return float(attr.f)
+            if attr.type == AttributeProto.STRING:
+                s = attr.s
+                try:
+                    return s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+                except Exception:
+                    return str(s)
+            if attr.type == AttributeProto.INTS:
+                return list(attr.ints)
+            if attr.type == AttributeProto.FLOATS:
+                return list(attr.floats)
+            # 其它类型用不到，返回默认
+            return default
+        return default
+
+    def _replace_attr(self, node, key, value):
+        # 删除已有的同名属性
+        kept = [a for a in node.attribute if a.name != key]
+        del node.attribute[:]
+        for a in kept:
+            node.attribute.append(a)
+        # 添加新属性
+        node.attribute.append(helper.make_attribute(key, value))
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[SetMVAUSparseMode] start")
+        print(f"[SetMVAUSparseMode] total nodes: {len(graph.node)}")
+
+        for idx, node in enumerate(graph.node):
+            if node.op_type != "MVAU_hls":
+                continue
+
+            print(f"\n[SetMVAUSparseMode] -> processing node #{idx}: name={node.name}, op_type={node.op_type}")
+
+            # 读取所需属性
+            MH   = self._get_attr(node, "MH",   None)
+            MW   = self._get_attr(node, "MW",   None)
+            PE   = self._get_attr(node, "PE",   None)
+            SIMD = self._get_attr(node, "SIMD", None)
+            sparsity = self._get_attr(node, "sparsity", 0.0)
+
+            print(f"[SetMVAUSparseMode]    MH={MH}, MW={MW}, PE={PE}, SIMD={SIMD}, sparsity={sparsity}")
+
+            # # 判定模式
+            # mode = "dense"
+            # if (MH is not None and PE is not None and MW is not None and SIMD is not None
+            #     and MH == PE and MW == SIMD):
+            #     mode = "lut_sparse"
+            #     reason = "MH==PE && MW==SIMD"
+            # elif sparsity is not None and float(sparsity) > 0.8:
+            #     mode = "spmv_sparse"
+            #     reason = "sparsity>0.8"
+            # else:
+            #     reason = "fallback dense"
+            mode = "spmv_sparse"
+            reason = "force spmv_sparse"
+
+            print(f"[SetMVAUSparseMode]    set sparse_mode='{mode}' ({reason})")
+
+            # 更新/新增 sparse_mode
+            self._replace_attr(node, "sparse_mode", mode)
+            graph_modified = True
+
+        print("[SetMVAUSparseMode] done, graph_modified =", graph_modified)
+        return (model, False)
+    
+class SetMVAUSparseMode_lutsponly(Transformation):
+    """遍历所有 MVAU_hls 节点，新增/更新 sparse_mode 属性。
+    规则：
+      1) 若 MH == PE 且 MW == SIMD -> 'lut_sparse'
+      2) 否则若 sparsity > 0.8 -> 'spmv_sparse'
+      3) 否则 -> 'dense'
+    注意：假定节点上已有 AnnotateMVAUSparsity 添加的 'sparsity' 属性。
+    若缺失则按 0.0 处理。
+    """
+
+    def _get_attr(self, node, name, default=None):
+        for attr in node.attribute:
+            if attr.name != name:
+                continue
+            # 按类型安全读取
+            if attr.type == AttributeProto.INT:
+                return int(attr.i)
+            if attr.type == AttributeProto.FLOAT:
+                return float(attr.f)
+            if attr.type == AttributeProto.STRING:
+                s = attr.s
+                try:
+                    return s.decode("utf-8") if isinstance(s, (bytes, bytearray)) else str(s)
+                except Exception:
+                    return str(s)
+            if attr.type == AttributeProto.INTS:
+                return list(attr.ints)
+            if attr.type == AttributeProto.FLOATS:
+                return list(attr.floats)
+            # 其它类型用不到，返回默认
+            return default
+        return default
+
+    def _replace_attr(self, node, key, value):
+        # 删除已有的同名属性
+        kept = [a for a in node.attribute if a.name != key]
+        del node.attribute[:]
+        for a in kept:
+            node.attribute.append(a)
+        # 添加新属性
+        node.attribute.append(helper.make_attribute(key, value))
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[SetMVAUSparseMode] start")
+        print(f"[SetMVAUSparseMode] total nodes: {len(graph.node)}")
+
+        for idx, node in enumerate(graph.node):
+            if node.op_type != "MVAU_hls":
+                continue
+
+            print(f"\n[SetMVAUSparseMode] -> processing node #{idx}: name={node.name}, op_type={node.op_type}")
+
+            # 读取所需属性
+            MH   = self._get_attr(node, "MH",   None)
+            MW   = self._get_attr(node, "MW",   None)
+            PE   = self._get_attr(node, "PE",   None)
+            SIMD = self._get_attr(node, "SIMD", None)
+            sparsity = self._get_attr(node, "sparsity", 0.0)
+
+            print(f"[SetMVAUSparseMode]    MH={MH}, MW={MW}, PE={PE}, SIMD={SIMD}, sparsity={sparsity}")
+
+            # # 判定模式
+            # mode = "dense"
+            # if (MH is not None and PE is not None and MW is not None and SIMD is not None
+            #     and MH == PE and MW == SIMD):
+            #     mode = "lut_sparse"
+            #     reason = "MH==PE && MW==SIMD"
+            # elif sparsity is not None and float(sparsity) > 0.8:
+            #     mode = "spmv_sparse"
+            #     reason = "sparsity>0.8"
+            # else:
+            #     reason = "fallback dense"
+            mode = "lut_sparse"
+            mem_mode = 'internal_embedded'
+            reason = "force lut_sparse"
+
+            print(f"[SetMVAUSparseMode]    set sparse_mode='{mode}' ({reason})")
+
+            # 更新/新增 sparse_mode
+            self._replace_attr(node, "sparse_mode", mode)
+            self._replace_attr(node, "mem_mode", mem_mode)
+            graph_modified = True
+
+        print("[SetMVAUSparseMode] done, graph_modified =", graph_modified)
+        return (model, False)
+
+class AnnotateMVAUTileSparsity(Transformation):
+    """在图中找到所有 MVAU_hls 节点，对其权重(输入2)按(PE, SIMD) tile进行稀疏度分析并写回到节点属性中"""
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[AnnotateMVAUTileSparsity] start")
+        print(f"[AnnotateMVAUTileSparsity] total nodes: {len(graph.node)}")
+
+        for idx, node in enumerate(graph.node):
+            # 只处理 MVAU_hls
+            if node.op_type != "MVAU_hls":
+                continue
+
+            print(f"\n[AnnotateMVAUTileSparsity] -> processing node #{idx}: name={node.name}, op_type={node.op_type}")
+
+            # MVAU 通常至少有 3 个输入: data, ..., weights
+            if len(node.input) < 3:
+                print(f"[AnnotateMVAUTileSparsity]    skip: node has only {len(node.input)} inputs, no weight at index 2")
+                continue
+
+            weight_name = node.input[1]
+            print(f"[AnnotateMVAUTileSparsity]    weight input name: {weight_name}")
+
+            # 读取 PE / SIMD
+            pe = None
+            simd = None
+            for attr in node.attribute:
+                if attr.name == "PE":
+                    pe = int(attr.i) if hasattr(attr, "i") else None
+                elif attr.name == "SIMD":
+                    simd = int(attr.i) if hasattr(attr, "i") else None
+
+            if pe is None or simd is None or pe <= 0 or simd <= 0:
+                print(f"[AnnotateMVAUTileSparsity]    skip: invalid PE/SIMD (PE={pe}, SIMD={simd})")
+                continue
+
+            # 获取权重
+            weight_arr = model.get_initializer(weight_name)
+            if weight_arr is None:
+                print(f"[AnnotateMVAUTileSparsity]    skip: weight '{weight_name}' is not an initializer (maybe runtime)")
+                continue
+
+            w_np = weight_arr if isinstance(weight_arr, np.ndarray) else np.array(weight_arr)
+            print(f"[AnnotateMVAUTileSparsity]    weight shape: {w_np.shape}")
+
+            # ---- 将权重展开为二维矩阵 [out_dim, in_dim] ----
+            if w_np.ndim == 0:
+                w2d = w_np.reshape(1, 1)
+            elif w_np.ndim == 1:
+                w2d = w_np.reshape(-1, 1)
+            elif w_np.ndim == 2:
+                w2d = w_np
+            else:
+                in_dim = w_np.shape[-1]
+                out_dim = int(np.prod(w_np.shape[:-1]))
+                w2d = w_np.reshape(out_dim, in_dim)
+
+            out_dim, in_dim = w2d.shape
+            print(f"[AnnotateMVAUTileSparsity]    2D view shape: {w2d.shape}, PE={pe}, SIMD={simd}")
+
+            total_tiles = 0
+            zero_tiles = 0
+
+            # 遍历 tile
+            for r in range(0, out_dim, pe):
+                for c in range(0, in_dim, simd):
+                    tile = w2d[r:min(r + pe, out_dim), c:min(c + simd, in_dim)]
+                    total_tiles += 1
+                    if np.count_nonzero(tile) == 0:
+                        zero_tiles += 1
+
+            if total_tiles == 0:
+                print("[AnnotateMVAUTileSparsity]    warning: no tiles found, set tile_sparsity=0.0")
+                tile_sparsity = 0.0
+            else:
+                tile_sparsity = float(zero_tiles) / float(total_tiles)
+
+            print(f"[AnnotateMVAUTileSparsity]    tiles: total={total_tiles}, zero_tiles={zero_tiles}, tile_sparsity={tile_sparsity:.6f}")
+
+            # 清理旧的 tile_sparsity 属性
+            kept_attrs = []
+            had_old = False
+            for attr in node.attribute:
+                if attr.name == "tile_sparsity":
+                    had_old = True
+                else:
+                    kept_attrs.append(attr)
+            if had_old:
+                print("[AnnotateMVAUTileSparsity]    node already had 'tile_sparsity' attribute -> replacing")
+
+            del node.attribute[:]
+            for attr in kept_attrs:
+                node.attribute.append(attr)
+
+            # 添加新的属性
+            node.attribute.append(helper.make_attribute("tile_sparsity", tile_sparsity))
+            print("[AnnotateMVAUTileSparsity]    added attribute: tile_sparsity =", tile_sparsity)
+
+            graph_modified = True
+
+        print("[AnnotateMVAUTileSparsity] done, graph_modified =", graph_modified)
+        return (model, False)
+
+class GlobalPruneMBv1Weights90(Transformation):
+    def __init__(self, prune_ratio=0.98, min_nonzero_per_layer=32):
+        super().__init__()
+        self.prune_ratio = prune_ratio
+        self.min_nonzero_per_layer = min_nonzero_per_layer
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[GlobalPruneMVAUWeights90] start")
+        print(f"[GlobalPruneMVAUWeights90] total nodes: {len(graph.node)}")
+        print(f"[GlobalPruneMVAUWeights90] prune_ratio={self.prune_ratio}, "
+              f"min_nonzero_per_layer={self.min_nonzero_per_layer}")
+
+        # ---------- 第 1 遍：收集所有 MVAU_hls 的权重，做全局阈值统计 ----------
+        weight_infos = []   # 每个元素: dict(node_idx, node_name, weight_name, w_np)
+        all_abs_flat_list = []
+
+        for idx, node in enumerate(graph.node):
+            if node.op_type != "MVAU_hls":
+                continue
+            # node_inst = getCustomOp(node)
+            # if node_inst.get_nodeattr("MW")
+            print(f"\n[GlobalPruneMVAUWeights90] -> found MVAU_hls node #{idx}: "
+                  f"name={node.name}, op_type={node.op_type}")
+
+            if len(node.input) < 2:
+                print(f"[GlobalPruneMVAUWeights90]    skip: node has only "
+                      f"{len(node.input)} inputs, no weight at index 1")
+                continue
+
+            weight_name = node.input[1]
+            print(f"[GlobalPruneMVAUWeights90]    weight input name: {weight_name}")
+
+            w_arr = model.get_initializer(weight_name)
+            if w_arr is None:
+                print(f"[GlobalPruneMVAUWeights90]    skip: weight '{weight_name}' "
+                      f"is not an initializer (maybe runtime)")
+                continue
+
+            w_np = w_arr
+            if not isinstance(w_np, np.ndarray):
+                w_np = np.array(w_arr)
+
+            print(f"[GlobalPruneMVAUWeights90]    weight shape: {w_np.shape}, "
+                  f"dtype={w_np.dtype}")
+
+            flat_abs = np.abs(w_np).flatten().astype(np.float64)
+            if flat_abs.size == 0:
+                print("[GlobalPruneMVAUWeights90]    warning: weight tensor has 0 elements")
+                continue
+
+            all_abs_flat_list.append(flat_abs)
+            weight_infos.append({
+                "node_idx": idx,
+                "node_name": node.name,
+                "weight_name": weight_name,
+                "w_np": w_np,
+            })
+
+        if len(weight_infos) == 0:
+            print("[GlobalPruneMVAUWeights90] no MVAU_hls weights found, nothing to prune.")
+            return (model, False)
+
+        all_abs_flat = np.concatenate(all_abs_flat_list, axis=0)
+        total_elems = all_abs_flat.size
+        print(f"\n[GlobalPruneMVAUWeights90] collected total elements: {total_elems}")
+
+        if total_elems == 0:
+            print("[GlobalPruneMVAUWeights90] total elements is 0, nothing to prune.")
+            return (model, False)
+
+        keep_ratio = 1.0 - self.prune_ratio
+        if keep_ratio <= 0.0:
+            print("[GlobalPruneMVAUWeights90] keep_ratio <= 0, force keep_ratio=1e-6")
+            keep_ratio = 1e-6
+
+        # 计算“保留 top-k”对应的全局阈值：
+        #   目标是保留 top (keep_ratio) 的权重，等价于用百分位数 100 * (1 - keep_ratio)
+        #   对于 90% 剪枝（keep_ratio=0.1），就是 90 百分位
+        percentile = 100.0 * (1.0 - keep_ratio)
+        global_threshold = np.percentile(all_abs_flat, percentile)
+
+        print(f"[GlobalPruneMVAUWeights90] global threshold (percentile={percentile:.2f}): "
+              f"{global_threshold:.6e}")
+
+        # ---------- 第 2 遍：按全局阈值剪枝，并保证每层至少保留 min_nonzero_per_layer ----------
+        global_old_nonzero = 0
+        global_new_nonzero = 0
+
+        for info in weight_infos:
+            idx = info["node_idx"]
+            node_name = info["node_name"]
+            weight_name = info["weight_name"]
+            w_np = info["w_np"]
+
+            print(f"\n[GlobalPruneMVAUWeights90] -> pruning node #{idx}, name={node_name}, "
+                  f"weight={weight_name}")
+
+            flat = w_np.flatten()
+            abs_flat = np.abs(flat)
+
+            total = flat.size
+            old_nonzero = np.count_nonzero(flat)
+            global_old_nonzero += old_nonzero
+
+            if total == 0:
+                print("[GlobalPruneMVAUWeights90]    skip: weight has 0 elements")
+                continue
+
+            # 初步：按全局阈值，保留 abs > threshold 的权重
+            keep_mask = abs_flat > global_threshold
+            num_keep_initial = int(np.count_nonzero(keep_mask))
+
+            print(f"[GlobalPruneMVAUWeights90]    total={total}, "
+                  f"old_nonzero={old_nonzero}, "
+                  f"keep_by_threshold={num_keep_initial}")
+
+            # 约束 1：如果该层元素总数小于 min_nonzero_per_layer，
+            #         则没法“保留至少 64 个非零”——直接全部保留（不做剪枝）
+            if total < self.min_nonzero_per_layer:
+                print(f"[GlobalPruneMVAUWeights90]    total({total}) < "
+                      f"min_nonzero_per_layer({self.min_nonzero_per_layer}), "
+                      f"skip pruning for this weight (keep all).")
+                keep_mask = np.ones_like(flat, dtype=bool)
+            else:
+                # 约束 2：确保每层至少保留 min_nonzero_per_layer 个非零权重
+                if num_keep_initial < self.min_nonzero_per_layer:
+                    print(f"[GlobalPruneMVAUWeights90]    keep_by_threshold({num_keep_initial}) "
+                          f"< min_nonzero_per_layer({self.min_nonzero_per_layer}), "
+                          f"force keeping top-{self.min_nonzero_per_layer} by magnitude.")
+
+                    # 找到该层中按绝对值排序的 top-k 下标
+                    k = self.min_nonzero_per_layer
+                    # 使用 argpartition 实现 O(n) 级别的 top-k
+                    # 排序按 -abs_flat，即绝对值从大到小
+                    topk_idx = np.argpartition(-abs_flat, k - 1)[:k]
+                    keep_mask[:] = False
+                    keep_mask[topk_idx] = True
+
+            # 应用剪枝：keep_mask 为 True 的保持原值，False 的置 0
+            pruned_flat = flat.copy()
+            pruned_flat[~keep_mask] = 0
+
+            new_nonzero = int(np.count_nonzero(pruned_flat))
+            global_new_nonzero += new_nonzero
+
+            new_sparsity = 1.0 - float(new_nonzero) / float(total)
+            print(f"[GlobalPruneMVAUWeights90]    new_nonzero={new_nonzero}, "
+                  f"new_sparsity={new_sparsity:.6f}")
+
+            # reshape 回原来的形状并保持 dtype
+            pruned_w = pruned_flat.reshape(w_np.shape).astype(w_np.dtype)
+
+            # 写回到模型的 initializer
+            model.set_initializer(weight_name, pruned_w)
+            graph_modified = True
+
+        # ---------- 全局统计信息 ----------
+        if global_old_nonzero == 0:
+            print("\n[GlobalPruneMVAUWeights90] warning: global_old_nonzero == 0 (all weights already zero?)")
+        else:
+            global_old_sparsity = 1.0 - float(global_old_nonzero) / float(total_elems)
+            global_new_sparsity = 1.0 - float(global_new_nonzero) / float(total_elems)
+            print("\n[GlobalPruneMVAUWeights90] global stats:")
+            print(f"    total_elems       = {total_elems}")
+            print(f"    old_nonzero       = {global_old_nonzero}")
+            print(f"    old_sparsity      = {global_old_sparsity:.6f}")
+            print(f"    new_nonzero       = {global_new_nonzero}")
+            print(f"    new_sparsity      = {global_new_sparsity:.6f}")
+            print(f"    target_prune_ratio= {self.prune_ratio:.6f} "
+                  "(note: per-layer min_nonzero may slightly deviate from exact ratio)")
+
+        print("\n[GlobalPruneMVAUWeights90] done, graph_modified =", graph_modified)
+        return (model, False)
+
+
+
+class GlobalPruneMVAUWeights90(Transformation):
+    """
+    在图中找到所有 MVAU_hls 节点，对其权重做**全局 90% 剪枝**（按绝对值大小全局排序），
+    并确保每一层保留的非零权重不少于 min_nonzero_per_layer 个，
+    然后将剪枝后的权重写回到 ONNX 图中。
+    """
+
+    def __init__(self, prune_ratio=0.9, min_nonzero_per_layer=64):
+        super().__init__()
+        self.prune_ratio = prune_ratio
+        self.min_nonzero_per_layer = min_nonzero_per_layer
+
+    def apply(self, model):
+        graph = model.graph
+        graph_modified = False
+
+        print("[GlobalPruneMVAUWeights90] start")
+        print(f"[GlobalPruneMVAUWeights90] total nodes: {len(graph.node)}")
+        print(f"[GlobalPruneMVAUWeights90] prune_ratio={self.prune_ratio}, "
+              f"min_nonzero_per_layer={self.min_nonzero_per_layer}")
+
+        # ---------- 第 1 遍：收集所有 MVAU_hls 的权重，做全局阈值统计 ----------
+        weight_infos = []   # 每个元素: dict(node_idx, node_name, weight_name, w_np)
+        all_abs_flat_list = []
+
+        for idx, node in enumerate(graph.node):
+            if node.op_type != "MVAU_hls":
+                continue
+
+            print(f"\n[GlobalPruneMVAUWeights90] -> found MVAU_hls node #{idx}: "
+                  f"name={node.name}, op_type={node.op_type}")
+
+            if len(node.input) < 2:
+                print(f"[GlobalPruneMVAUWeights90]    skip: node has only "
+                      f"{len(node.input)} inputs, no weight at index 1")
+                continue
+
+            weight_name = node.input[1]
+            print(f"[GlobalPruneMVAUWeights90]    weight input name: {weight_name}")
+
+            w_arr = model.get_initializer(weight_name)
+            if w_arr is None:
+                print(f"[GlobalPruneMVAUWeights90]    skip: weight '{weight_name}' "
+                      f"is not an initializer (maybe runtime)")
+                continue
+
+            w_np = w_arr
+            if not isinstance(w_np, np.ndarray):
+                w_np = np.array(w_arr)
+
+            print(f"[GlobalPruneMVAUWeights90]    weight shape: {w_np.shape}, "
+                  f"dtype={w_np.dtype}")
+
+            flat_abs = np.abs(w_np).flatten().astype(np.float64)
+            if flat_abs.size == 0:
+                print("[GlobalPruneMVAUWeights90]    warning: weight tensor has 0 elements")
+                continue
+
+            all_abs_flat_list.append(flat_abs)
+            weight_infos.append({
+                "node_idx": idx,
+                "node_name": node.name,
+                "weight_name": weight_name,
+                "w_np": w_np,
+            })
+
+        if len(weight_infos) == 0:
+            print("[GlobalPruneMVAUWeights90] no MVAU_hls weights found, nothing to prune.")
+            return (model, False)
+
+        all_abs_flat = np.concatenate(all_abs_flat_list, axis=0)
+        total_elems = all_abs_flat.size
+        print(f"\n[GlobalPruneMVAUWeights90] collected total elements: {total_elems}")
+
+        if total_elems == 0:
+            print("[GlobalPruneMVAUWeights90] total elements is 0, nothing to prune.")
+            return (model, False)
+
+        keep_ratio = 1.0 - self.prune_ratio
+        if keep_ratio <= 0.0:
+            print("[GlobalPruneMVAUWeights90] keep_ratio <= 0, force keep_ratio=1e-6")
+            keep_ratio = 1e-6
+
+        # 计算“保留 top-k”对应的全局阈值：
+        #   目标是保留 top (keep_ratio) 的权重，等价于用百分位数 100 * (1 - keep_ratio)
+        #   对于 90% 剪枝（keep_ratio=0.1），就是 90 百分位
+        percentile = 100.0 * (1.0 - keep_ratio)
+        global_threshold = np.percentile(all_abs_flat, percentile)
+
+        print(f"[GlobalPruneMVAUWeights90] global threshold (percentile={percentile:.2f}): "
+              f"{global_threshold:.6e}")
+
+        # ---------- 第 2 遍：按全局阈值剪枝，并保证每层至少保留 min_nonzero_per_layer ----------
+        global_old_nonzero = 0
+        global_new_nonzero = 0
+
+        for info in weight_infos:
+            idx = info["node_idx"]
+            node_name = info["node_name"]
+            weight_name = info["weight_name"]
+            w_np = info["w_np"]
+
+            print(f"\n[GlobalPruneMVAUWeights90] -> pruning node #{idx}, name={node_name}, "
+                  f"weight={weight_name}")
+
+            flat = w_np.flatten()
+            abs_flat = np.abs(flat)
+
+            total = flat.size
+            old_nonzero = np.count_nonzero(flat)
+            global_old_nonzero += old_nonzero
+
+            if total == 0:
+                print("[GlobalPruneMVAUWeights90]    skip: weight has 0 elements")
+                continue
+
+            # 初步：按全局阈值，保留 abs > threshold 的权重
+            keep_mask = abs_flat > global_threshold
+            num_keep_initial = int(np.count_nonzero(keep_mask))
+
+            print(f"[GlobalPruneMVAUWeights90]    total={total}, "
+                  f"old_nonzero={old_nonzero}, "
+                  f"keep_by_threshold={num_keep_initial}")
+
+            # 约束 1：如果该层元素总数小于 min_nonzero_per_layer，
+            #         则没法“保留至少 64 个非零”——直接全部保留（不做剪枝）
+            if total < self.min_nonzero_per_layer:
+                print(f"[GlobalPruneMVAUWeights90]    total({total}) < "
+                      f"min_nonzero_per_layer({self.min_nonzero_per_layer}), "
+                      f"skip pruning for this weight (keep all).")
+                keep_mask = np.ones_like(flat, dtype=bool)
+            else:
+                # 约束 2：确保每层至少保留 min_nonzero_per_layer 个非零权重
+                if num_keep_initial < self.min_nonzero_per_layer:
+                    print(f"[GlobalPruneMVAUWeights90]    keep_by_threshold({num_keep_initial}) "
+                          f"< min_nonzero_per_layer({self.min_nonzero_per_layer}), "
+                          f"force keeping top-{self.min_nonzero_per_layer} by magnitude.")
+
+                    # 找到该层中按绝对值排序的 top-k 下标
+                    k = self.min_nonzero_per_layer
+                    # 使用 argpartition 实现 O(n) 级别的 top-k
+                    # 排序按 -abs_flat，即绝对值从大到小
+                    topk_idx = np.argpartition(-abs_flat, k - 1)[:k]
+                    keep_mask[:] = False
+                    keep_mask[topk_idx] = True
+
+            # 应用剪枝：keep_mask 为 True 的保持原值，False 的置 0
+            pruned_flat = flat.copy()
+            pruned_flat[~keep_mask] = 0
+
+            new_nonzero = int(np.count_nonzero(pruned_flat))
+            global_new_nonzero += new_nonzero
+
+            new_sparsity = 1.0 - float(new_nonzero) / float(total)
+            print(f"[GlobalPruneMVAUWeights90]    new_nonzero={new_nonzero}, "
+                  f"new_sparsity={new_sparsity:.6f}")
+
+            # reshape 回原来的形状并保持 dtype
+            pruned_w = pruned_flat.reshape(w_np.shape).astype(w_np.dtype)
+
+            # 写回到模型的 initializer
+            model.set_initializer(weight_name, pruned_w)
+            graph_modified = True
+
+        # ---------- 全局统计信息 ----------
+        if global_old_nonzero == 0:
+            print("\n[GlobalPruneMVAUWeights90] warning: global_old_nonzero == 0 (all weights already zero?)")
+        else:
+            global_old_sparsity = 1.0 - float(global_old_nonzero) / float(total_elems)
+            global_new_sparsity = 1.0 - float(global_new_nonzero) / float(total_elems)
+            print("\n[GlobalPruneMVAUWeights90] global stats:")
+            print(f"    total_elems       = {total_elems}")
+            print(f"    old_nonzero       = {global_old_nonzero}")
+            print(f"    old_sparsity      = {global_old_sparsity:.6f}")
+            print(f"    new_nonzero       = {global_new_nonzero}")
+            print(f"    new_sparsity      = {global_new_sparsity:.6f}")
+            print(f"    target_prune_ratio= {self.prune_ratio:.6f} "
+                  "(note: per-layer min_nonzero may slightly deviate from exact ratio)")
+
+        print("\n[GlobalPruneMVAUWeights90] done, graph_modified =", graph_modified)
         return (model, False)
