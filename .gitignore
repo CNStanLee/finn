@@ -96,3 +96,6 @@ MANIFEST
 
 # downloaded dep repos
 /deps/
+
+/scripts/DAC2026/
+/notebooks/lab_new/
